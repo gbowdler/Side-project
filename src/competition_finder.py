@@ -1,5 +1,5 @@
-import json
 import re
+import urllib.parse
 
 import requests
 from bs4 import BeautifulSoup
@@ -64,27 +64,36 @@ def _fetch_html(url: str) -> str:
         return ""
 
 
-def _log_html_sample(html: str, label: str):
-    """Print a slice of raw HTML to help debug link/email patterns."""
+def _html_sample(html: str, chars: int = 2000) -> str:
     soup = BeautifulSoup(html, "lxml")
     body = soup.find("body")
-    sample = str(body)[:2000] if body else html[:2000]
-    print(f"  --- {label} HTML sample ---")
-    print(sample)
-    print(f"  --- end sample ---")
+    return str(body)[:chars] if body else html[:chars]
+
+
+def _extract_redirect_url(href: str) -> str | None:
+    """Extract destination URL from redirect-style href (e.g. /out.php?url=https://...)."""
+    parsed = urllib.parse.urlparse(href)
+    params = urllib.parse.parse_qs(parsed.query)
+    for key in ("url", "link", "dest", "goto", "out", "u", "ref", "to"):
+        if key in params:
+            val = params[key][0]
+            if val.startswith("http"):
+                return val
+    return None
 
 
 def _parse_loquax_email(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
-    competitions = []
-    seen: set[str] = set()
-    email_re = re.compile(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}")
 
-    # Log all anchor hrefs to see what link patterns exist
+    # Diagnostic: show what hrefs exist and a raw HTML slice
     all_hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)][:30]
     print(f"  Loquax Email-In — first 30 hrefs: {all_hrefs}")
+    print(f"  Loquax Email-In — HTML sample:\n{_html_sample(html, 1500)}")
 
-    # Try mailto: links
+    competitions = []
+    seen: set[str] = set()
+
+    # Strategy 1: mailto: links
     for link in soup.find_all("a", href=True):
         href = link["href"]
         if href.lower().startswith("mailto:"):
@@ -101,21 +110,41 @@ def _parse_loquax_email(html: str) -> list[dict]:
                     "source": "Loquax Email-In",
                 })
 
-    # Fallback: bare email addresses anywhere in page text
-    if not competitions:
-        for m in email_re.finditer(soup.get_text()):
-            email = m.group()
-            if "loquax" in email or email in seen:
-                continue
-            seen.add(email)
-            competitions.append({
-                "title": email,
-                "url": "https://www.loquax.co.uk/email.php",
-                "entry_type": "email",
-                "entry_email": email,
-                "closing_date": None,
-                "source": "Loquax Email-In",
-            })
+    # Strategy 2: bare @ addresses in page text
+    email_re = re.compile(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}")
+    for m in email_re.finditer(soup.get_text()):
+        email = m.group()
+        if "loquax" in email or email in seen:
+            continue
+        seen.add(email)
+        competitions.append({
+            "title": email,
+            "url": "https://www.loquax.co.uk/email.php",
+            "entry_type": "email",
+            "entry_email": email,
+            "closing_date": None,
+            "source": "Loquax Email-In",
+        })
+
+    # Strategy 3: obfuscated emails like "name [at] domain.co.uk" or "name (at) domain dot co dot uk"
+    text = soup.get_text(" ", strip=True)
+    obf_re = re.compile(
+        r"([\w.+-]+)\s*[\[\(\{]?\s*at\s*[\]\)\}]?\s*([\w.-]+)\s*[\[\(\{]?\s*dot\s*[\]\)\}]?\s*([\w.]{2,})",
+        re.IGNORECASE,
+    )
+    for m in obf_re.finditer(text):
+        email = f"{m.group(1)}@{m.group(2)}.{m.group(3)}"
+        if "loquax" in email.lower() or email in seen:
+            continue
+        seen.add(email)
+        competitions.append({
+            "title": email,
+            "url": "https://www.loquax.co.uk/email.php",
+            "entry_type": "email",
+            "entry_email": email,
+            "closing_date": None,
+            "source": "Loquax Email-In",
+        })
 
     print(f"  Loquax email parser: {len(competitions)} entries")
     return competitions
@@ -124,70 +153,90 @@ def _parse_loquax_email(html: str) -> list[dict]:
 def _parse_loquax_online(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
 
-    # Log all external hrefs to see what link patterns exist
-    external = [a["href"] for a in soup.find_all("a", href=True)
-                if a["href"].startswith("http") and "loquax" not in a["href"]][:20]
-    print(f"  Loquax Online — external links found: {external}")
+    # Diagnostic
+    all_links = [(a.get("href", ""), a.get_text(strip=True)) for a in soup.find_all("a", href=True)][:30]
+    print(f"  Loquax Online — first 30 links: {all_links}")
+    print(f"  Loquax Online — HTML sample:\n{_html_sample(html, 1500)}")
 
     competitions = []
     seen: set[str] = set()
+
     for link in soup.find_all("a", href=True):
         href = link["href"]
-        if not href.startswith("http") or "loquax" in href:
-            continue
-        if _is_social_media_url(href) or href in seen:
-            continue
-        seen.add(href)
         title = link.get_text(strip=True) or (link.parent or link).get_text(" ", strip=True)[:100]
-        competitions.append({
-            "title": title[:150],
-            "url": href,
-            "entry_type": "web_form",
-            "closing_date": None,
-            "source": "Loquax Online Forms",
-        })
 
-    print(f"  Loquax online parser: {len(competitions)} entries")
+        # Strategy A: Loquax redirect links — extract destination from query param
+        dest = _extract_redirect_url(href)
+        if dest and not _is_social_media_url(dest) and dest not in seen:
+            seen.add(dest)
+            competitions.append({
+                "title": title[:150] or dest,
+                "url": dest,
+                "entry_type": "web_form",
+                "closing_date": None,
+                "source": "Loquax Online Forms",
+            })
+            continue
+
+        # Strategy B: direct external links
+        if href.startswith("http") and "loquax" not in href and not _is_social_media_url(href):
+            if href not in seen:
+                seen.add(href)
+                competitions.append({
+                    "title": title[:150] or href,
+                    "url": href,
+                    "entry_type": "web_form",
+                    "closing_date": None,
+                    "source": "Loquax Online Forms",
+                })
+
+    print(f"  Loquax online parser: {len(competitions)} competitions")
     return competitions
 
 
 def _parse_theprizefinder(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
+    BASE = "https://www.theprizefinder.com"
 
-    # Log all external hrefs to understand the link structure
-    external = [a["href"] for a in soup.find_all("a", href=True)
-                if a["href"].startswith("http") and "theprizefinder" not in a["href"]][:20]
-    print(f"  ThePrizeFinder — external links: {external}")
+    # Diagnostic
+    all_links = [(a.get("href", ""), a.get_text(strip=True)) for a in soup.find_all("a", href=True)][:30]
+    print(f"  ThePrizeFinder — first 30 links: {all_links}")
+    print(f"  ThePrizeFinder — HTML sample:\n{_html_sample(html, 1500)}")
 
-    # Log internal link patterns
-    internal = [a["href"] for a in soup.find_all("a", href=True)
-                if not a["href"].startswith("http")][:20]
-    print(f"  ThePrizeFinder — internal links: {internal}")
-
-    # Try all external links that aren't social media (competitions link out directly)
     competitions = []
     seen: set[str] = set()
+
     for link in soup.find_all("a", href=True):
         href = link["href"]
-        if not href.startswith("http"):
-            continue
-        if "theprizefinder" in href:
-            continue
-        if _is_social_media_url(href) or href in seen:
-            continue
-        seen.add(href)
         title = link.get_text(strip=True)
-        if not title or len(title) < 3:
-            title = (link.parent or link).get_text(" ", strip=True)[:100]
-        competitions.append({
-            "title": title[:150],
-            "url": href,
-            "entry_type": "web_form",
-            "closing_date": None,
-            "source": "The Prize Finder",
-        })
 
-    print(f"  ThePrizeFinder parser: {len(competitions)} entries")
+        # Strategy A: External competition links (not theprizefinder.com)
+        if href.startswith("http") and "theprizefinder" not in href:
+            if not _is_social_media_url(href) and href not in seen:
+                seen.add(href)
+                competitions.append({
+                    "title": title[:150] or href,
+                    "url": href,
+                    "entry_type": "web_form",
+                    "closing_date": None,
+                    "source": "The Prize Finder",
+                })
+            continue
+
+        # Strategy B: Internal competition-detail pages like /competitions/... or /win/...
+        if href.startswith("/") and any(seg in href for seg in ("/competitions/", "/competition/", "/win/", "/prize/")):
+            full_url = BASE + href
+            if full_url not in seen and not _is_social_media_url(full_url):
+                seen.add(full_url)
+                competitions.append({
+                    "title": title[:150] or href,
+                    "url": full_url,
+                    "entry_type": "web_form",
+                    "closing_date": None,
+                    "source": "The Prize Finder",
+                })
+
+    print(f"  ThePrizeFinder parser: {len(competitions)} competitions")
     return competitions
 
 
