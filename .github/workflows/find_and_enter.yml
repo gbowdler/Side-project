@@ -1,0 +1,49 @@
+name: Find and Enter Competitions
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+jobs:
+  enter-competitions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Find and enter competitions
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ENTRANT_NAME: ${{ secrets.ENTRANT_NAME }}
+          ENTRANT_PHONE: ${{ secrets.ENTRANT_PHONE }}
+          ENTRANT_ADDRESS_LINE1: ${{ secrets.ENTRANT_ADDRESS_LINE1 }}
+          ENTRANT_ADDRESS_LINE2: ${{ secrets.ENTRANT_ADDRESS_LINE2 }}
+          ENTRANT_CITY: ${{ secrets.ENTRANT_CITY }}
+          ENTRANT_POSTCODE: ${{ secrets.ENTRANT_POSTCODE }}
+          ENTRANT_DOB: ${{ secrets.ENTRANT_DOB }}
+          NOTIFICATION_EMAIL: ${{ secrets.NOTIFICATION_EMAIL }}
+        run: python main_enter.py
+
+      - name: Commit updated tracker
+        run: |
+          git config user.name "Competition Bot"
+          git config user.email "action@github.com"
+          git add data/entered_competitions.json
+          git diff --staged --quiet || git commit -m "Update competition tracker [skip ci]"
+          git push
