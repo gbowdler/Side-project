@@ -1,12 +1,14 @@
+import json
 import os
 import re
 import smtplib
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import requests
 from bs4 import BeautifulSoup
 from src.claude_agent import ask_claude
+from src.competition_finder import SOCIAL_MEDIA_DOMAINS
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
@@ -32,6 +34,11 @@ def _entrant_info() -> dict:
         "postcode": os.environ.get("ENTRANT_POSTCODE", ""),
         "dob": os.environ.get("ENTRANT_DOB", ""),
     }
+
+
+def _is_social_media_url(url: str) -> bool:
+    url_lower = url.lower()
+    return any(domain in url_lower for domain in SOCIAL_MEDIA_DOMAINS)
 
 
 def _has_captcha(html: str) -> bool:
@@ -72,7 +79,6 @@ Entrant details to use where needed:
 Competition page text:
 {page_text}"""
 
-    import json
     raw = ask_claude(prompt)
     try:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -148,7 +154,6 @@ Date of birth: {info['dob']}
 Page text (use to identify form fields):
 {page_text}"""
 
-    import json
     raw = ask_claude(prompt)
     try:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -208,6 +213,10 @@ def enter_competition(competition: dict) -> bool:
     title = competition.get("title", url)
 
     print(f"Entering: {title}")
+
+    if _is_social_media_url(url):
+        print("  Social media URL — skipping")
+        return False
 
     if entry_type == "email":
         return enter_by_email(competition)
