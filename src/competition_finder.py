@@ -17,15 +17,14 @@ SOCIAL_MEDIA_DOMAINS = [
     "linkedin.com",
 ]
 
-# Realistic browser headers to avoid blocks
+# No 'br' — requests can't decode Brotli, causing garbled responses
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "Cache-Control": "max-age=0",
 }
 
 SOURCES = [
@@ -46,15 +45,7 @@ SOURCES = [
         "name": "The Prize Finder",
         "url": "https://www.theprizefinder.com/competitions",
         "entry_type": "web_form",
-        "parser": "claude",
-        "hint": "Each competition listing shows a prize, closing date, and entry link. Skip social media giveaways (Instagram, Facebook, Twitter, TikTok).",
-    },
-    {
-        "name": "MSE Competitions",
-        "url": "https://forums.moneysavingexpert.com/categories/competition-time",
-        "entry_type": "web_form",
-        "parser": "claude",
-        "hint": "This is a forum where users post links to competitions. Extract competition titles and their external entry URLs. Skip social media.",
+        "parser": "theprizefinder",
     },
 ]
 
@@ -70,7 +61,6 @@ def _fetch_html(url: str) -> str:
         resp = session.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
         print(f"  HTTP {resp.status_code} ({len(resp.text)} chars)")
         if resp.status_code != 200:
-            print(f"  Non-200 response — content preview: {resp.text[:200]}")
             return ""
         return resp.text
     except Exception as e:
@@ -78,61 +68,104 @@ def _fetch_html(url: str) -> str:
         return ""
 
 
-def _html_to_text(html: str) -> str:
+def _html_to_text(html: str, limit: int = 20000) -> str:
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "nav", "footer", "header", "iframe"]):
         tag.decompose()
     text = soup.get_text(separator="\n", strip=True)
-    print(f"  Text preview: {text[:300]}")
-    return text[:10000]
+    print(f"  Text length after stripping: {len(text)} chars (sending first {min(limit, len(text))})")
+    return text[:limit]
 
 
-# Direct HTML parser for Loquax email-in page
-# Loquax lists competitions in a table: prize | email address | closing date
 def _parse_loquax_email(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     competitions = []
-    email_re = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+    seen_emails: set[str] = set()
+    email_re = re.compile(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}")
 
-    # Each competition is typically a table row
-    for row in soup.find_all("tr"):
-        cells = row.find_all(["td", "th"])
-        if len(cells) < 2:
+    # Try mailto: links first — Loquax often uses these
+    for link in soup.find_all("a", href=email_re):
+        href = link.get("href", "")
+        email_match = email_re.search(href)
+        if not email_match:
             continue
-        row_text = row.get_text(separator=" ", strip=True)
-        emails = email_re.findall(row_text)
-        if not emails:
+        email = email_match.group()
+        if email in seen_emails or "loquax" in email:
             continue
-        # Skip header rows
-        if any(h in row_text.lower() for h in ["email", "prize", "closing", "date"]):
-            if len(row_text) < 60:
-                continue
+        seen_emails.add(email)
+        # Grab surrounding context for the title
+        parent_text = (link.parent or link).get_text(separator=" ", strip=True)[:150]
         competitions.append({
-            "title": cells[0].get_text(strip=True)[:120],
+            "title": parent_text or email,
             "url": "https://www.loquax.co.uk/email.php",
             "entry_type": "email",
-            "entry_email": emails[0],
-            "closing_date": cells[-1].get_text(strip=True) if len(cells) > 2 else None,
+            "entry_email": email,
+            "closing_date": None,
             "source": "Loquax Email-In",
         })
 
-    # Fallback: scan entire page for email addresses with surrounding context
+    # Fallback: scan table rows for bare email addresses
     if not competitions:
-        text = soup.get_text(separator="\n", strip=True)
-        for match in email_re.finditer(text):
-            start = max(0, match.start() - 80)
-            context = text[start: match.end() + 40].strip()
-            if "@loquax" in match.group() or "@example" in match.group():
+        for row in soup.find_all("tr"):
+            row_text = row.get_text(separator=" ", strip=True)
+            emails = email_re.findall(row_text)
+            for email in emails:
+                if "loquax" in email or email in seen_emails:
+                    continue
+                seen_emails.add(email)
+                competitions.append({
+                    "title": row_text[:120],
+                    "url": "https://www.loquax.co.uk/email.php",
+                    "entry_type": "email",
+                    "entry_email": email,
+                    "closing_date": None,
+                    "source": "Loquax Email-In",
+                })
+
+    print(f"  Loquax email parser found {len(competitions)} entries (mailto links + table scan)")
+    return competitions
+
+
+def _parse_theprizefinder(html: str) -> list[dict]:
+    """Extract competition links directly from ThePrizeFinder HTML."""
+    soup = BeautifulSoup(html, "lxml")
+    competitions = []
+    seen_urls: set[str] = set()
+
+    # ThePrizeFinder competition links go to /competition/<slug>
+    for link in soup.find_all("a", href=re.compile(r"theprizefinder\.com/competition/")):
+        url = link.get("href", "")
+        if not url.startswith("http"):
+            url = "https://www.theprizefinder.com" + url
+        if url in seen_urls or _is_social_media_url(url):
+            continue
+        seen_urls.add(url)
+        title = link.get_text(strip=True) or url
+        competitions.append({
+            "title": title,
+            "url": url,
+            "entry_type": "web_form",
+            "closing_date": None,
+            "source": "The Prize Finder",
+        })
+
+    # Also check relative links like /competition/<slug>
+    if not competitions:
+        for link in soup.find_all("a", href=re.compile(r"^/competition/")):
+            url = "https://www.theprizefinder.com" + link.get("href", "")
+            if url in seen_urls:
                 continue
+            seen_urls.add(url)
+            title = link.get_text(strip=True) or url
             competitions.append({
-                "title": context[:100],
-                "url": "https://www.loquax.co.uk/email.php",
-                "entry_type": "email",
-                "entry_email": match.group(),
+                "title": title,
+                "url": url,
+                "entry_type": "web_form",
                 "closing_date": None,
-                "source": "Loquax Email-In",
+                "source": "The Prize Finder",
             })
 
+    print(f"  ThePrizeFinder parser found {len(competitions)} competition links")
     return competitions
 
 
@@ -151,7 +184,6 @@ Extract all competitions and return a JSON array (nothing else) where each objec
 Rules:
 - Only include entries with a valid http URL
 - Skip any competition where the URL is a social media page
-- Skip any that requires following on social media
 - If no competitions found, return []
 
 Page text:
@@ -169,7 +201,7 @@ Page text:
 
 def find_competitions() -> list[dict]:
     all_competitions = []
-    seen_urls: set[str] = set()
+    seen_keys: set[str] = set()
 
     for source in SOURCES:
         name = source["name"]
@@ -184,11 +216,13 @@ def find_competitions() -> list[dict]:
 
         if parser == "loquax_email":
             competitions = _parse_loquax_email(html)
+        elif parser == "theprizefinder":
+            competitions = _parse_theprizefinder(html)
         else:
             page_text = _html_to_text(html)
             competitions = _claude_extract(page_text, entry_type, name, source.get("hint", ""))
 
-        print(f"  Extracted {len(competitions)} competitions before filtering")
+        print(f"  {len(competitions)} competitions before filtering")
 
         for comp in competitions:
             comp_url = comp.get("url", "")
@@ -197,10 +231,9 @@ def find_competitions() -> list[dict]:
             if _is_social_media_url(comp_url):
                 print(f"  Skipping social media: {comp_url}")
                 continue
-            # For email-in comps the URL is the listing page — dedupe by email instead
             dedup_key = comp.get("entry_email", comp_url)
-            if dedup_key not in seen_urls:
-                seen_urls.add(dedup_key)
+            if dedup_key not in seen_keys:
+                seen_keys.add(dedup_key)
                 all_competitions.append(comp)
 
     print(f"Total unique enterable competitions: {len(all_competitions)}")
