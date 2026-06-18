@@ -11,7 +11,9 @@ from src.claude_agent import ask_claude
 from src.competition_finder import SOCIAL_MEDIA_DOMAINS
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
 }
 
 CAPTCHA_PATTERNS = [
@@ -42,8 +44,7 @@ def _is_social_media_url(url: str) -> bool:
 
 
 def _has_captcha(html: str) -> bool:
-    html_lower = html.lower()
-    return any(p in html_lower for p in CAPTCHA_PATTERNS)
+    return any(p in html.lower() for p in CAPTCHA_PATTERNS)
 
 
 def _fetch_page(url: str) -> tuple[str, str]:
@@ -60,12 +61,41 @@ def _fetch_page(url: str) -> tuple[str, str]:
 
 
 def enter_by_email(competition: dict) -> bool:
+    info = _entrant_info()
+
+    # Use pre-parsed email address if available (e.g. from Loquax direct parsing)
+    to_email = competition.get("entry_email", "")
+    title = competition.get("title", "")
+
+    if to_email:
+        subject = f"Competition Entry"
+        body = f"Please enter me into this competition.\n\nName: {info['name']}\nEmail: {info['email']}"
+        # Ask Claude to craft a better entry email using the title as context
+        prompt = f"""Write a brief, natural competition entry email.
+
+Competition: {title}
+Entry email address: {to_email}
+Entrant name: {info['name']}
+Entrant email: {info['email']}
+
+Return JSON only with keys: "subject" and "body". Keep body to 2-3 sentences max."""
+        raw = ask_claude(prompt, max_tokens=300)
+        try:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+                subject = parsed.get("subject", subject)
+                body = parsed.get("body", body)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        return _send_email(to_email, subject, body)
+
+    # Fall back to fetching the competition page and asking Claude to extract entry details
     url = competition.get("url", "")
-    html, page_text = _fetch_page(url)
+    _, page_text = _fetch_page(url)
     if not page_text:
         return False
 
-    info = _entrant_info()
     prompt = f"""A competition page requires an email entry. Extract the entry details.
 
 Return JSON only with keys:
@@ -73,8 +103,8 @@ Return JSON only with keys:
 - "subject": the email subject line required
 - "body": the email body text to send
 
-Entrant details to use where needed:
-{info}
+Entrant details:
+Name: {info['name']}, Email: {info['email']}, Phone: {info['phone']}
 
 Competition page text:
 {page_text}"""
@@ -134,7 +164,7 @@ def enter_by_web_form(competition: dict) -> bool:
     info = _entrant_info()
     prompt = f"""A competition web form needs to be filled in and submitted.
 
-Describe step-by-step Playwright actions to fill and submit the form. Return JSON only:
+Return JSON only:
 {{
   "actions": [
     {{"type": "fill", "selector": "css_selector", "value": "value_to_enter"}},
@@ -145,13 +175,11 @@ Describe step-by-step Playwright actions to fill and submit the form. Return JSO
 }}
 
 Entrant details:
-Name: {info['name']}
-Email: {info['email']}
-Phone: {info['phone']}
+Name: {info['name']}, Email: {info['email']}, Phone: {info['phone']}
 Address: {info['address_line1']}, {info['address_line2']}, {info['city']}, {info['postcode']}
 Date of birth: {info['dob']}
 
-Page text (use to identify form fields):
+Page text:
 {page_text}"""
 
     raw = ask_claude(prompt)
@@ -159,13 +187,12 @@ Page text (use to identify form fields):
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not match:
             return False
-        plan = json.loads(match.group())
-        actions = plan.get("actions", [])
+        actions = json.loads(match.group()).get("actions", [])
     except (json.JSONDecodeError, AttributeError):
         return False
 
     if not actions:
-        print("  No actions extracted")
+        print("  No form actions extracted")
         return False
 
     return _execute_playwright_actions(url, actions)
@@ -196,7 +223,7 @@ def _execute_playwright_actions(url: str, actions: list[dict]) -> bool:
                     elif atype == "check":
                         page.check(selector, timeout=5000)
                 except PlaywrightTimeout:
-                    print(f"  Timeout on action {atype} {selector} — continuing")
+                    print(f"  Timeout on {atype} {selector} — continuing")
                 except Exception as e:
                     print(f"  Action failed ({atype} {selector}): {e}")
 
@@ -224,9 +251,7 @@ def enter_competition(competition: dict) -> bool:
         return enter_by_web_form(competition)
     else:
         html, _ = _fetch_page(url)
-        if not html:
-            return False
-        if _has_captcha(html):
-            print("  CAPTCHA detected — skipping")
+        if not html or _has_captcha(html):
+            print("  CAPTCHA detected or page unavailable — skipping")
             return False
         return enter_by_web_form(competition)
